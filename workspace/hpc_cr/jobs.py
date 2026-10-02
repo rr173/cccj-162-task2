@@ -19,7 +19,14 @@ from .checkpoints import (
     shard_id,
 )
 from .epochs import Scheduler
-from .errors import Conflict, FenceViolation, NotFound, ValidationError
+from .errors import (
+    Conflict,
+    FenceViolation,
+    InvalidToken,
+    NotFound,
+    ValidationError,
+)
+from .events import AUTH_FAILED, SecurityEventLog, token_fingerprint
 from .leases import LeaseManager
 from .storage import ContentStore, OutputLog
 
@@ -96,6 +103,7 @@ class RestoreReport:
     lease: dict | None = None
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
+    security_events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +124,7 @@ class RestoreReport:
             "lease": self.lease,
             "warnings": list(self.warnings),
             "error": self.error,
+            "security_events": list(self.security_events),
         }
 
     def to_markdown(self) -> str:
@@ -176,6 +185,22 @@ def render_report_md(r: RestoreReport) -> str:
             f"- 状态: {r.lease['state']}",
             f"- 有效期至: {time.strftime('%H:%M:%S', time.localtime(r.lease['expires_ts']))}",
         ]
+    if r.security_events:
+        lines += [
+            "",
+            "## 安全事件 (授权失败, 不含凭证原文)",
+            "",
+            "| seq | 时间 | 操作 | 原因 | 凭证指纹 |",
+            "|---|---|---|---|---|",
+        ]
+        for e in r.security_events:
+            d = e.get("detail", {})
+            lines.append(
+                f"| {e.get('seq')} | "
+                f"{time.strftime('%H:%M:%S', time.localtime(e.get('ts', 0)))} | "
+                f"{d.get('operation', '')} | {d.get('reason', '')} | "
+                f"{d.get('token_fingerprint') or '-'} |"
+            )
     if r.warnings:
         lines += ["", "## 警告", ""]
         lines += [f"- {w}" for w in r.warnings]
@@ -280,11 +305,44 @@ class Job:
 class JobManager:
     """作业注册表 + 全部编排用例。"""
 
-    def __init__(self, scheduler: Scheduler):
+    def __init__(self, scheduler: Scheduler, data_dir: str | None = None):
         self.scheduler = scheduler
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self.store = ContentStore()
+        # 顺序化安全事件日志: 配置 data_dir 时 JSONL 落盘, 重启后仍可查询
+        self.security_log = (
+            SecurityEventLog.in_dir(data_dir)
+            if data_dir
+            else SecurityEventLog()
+        )
+
+    def close(self) -> None:
+        self.security_log.close()
+
+    # ---------------------------------------------------- security events
+    def _record_auth_failure(
+        self,
+        job_id: str,
+        *,
+        operation: str,
+        token: str | None,
+        exc: "FenceViolation | InvalidToken",
+        extra: dict | None = None,
+    ) -> dict:
+        """授权失败统一落一条顺序化安全事件 (绝不包含凭证原文)。"""
+        detail = {
+            "operation": operation,
+            "reason": getattr(exc, "reason", None) or "unknown",
+            "error_code": exc.error_code,
+            "http_status": exc.http_status,
+            "token_fingerprint": token_fingerprint(token),
+            "message": str(exc),
+        }
+        if extra:
+            detail.update(extra)
+        return self.security_log.record(
+            job_id=job_id, event=AUTH_FAILED, detail=detail)
 
     # ------------------------------------------------------------ create
     def create_job(
@@ -460,16 +518,27 @@ class JobManager:
             return {"node": node.to_dict(), "lost_ranks": lost_ranks}
 
     # ------------------------------------------------------- shard write
-    def _check_epoch_token(self, job: Job, token: str):
-        payload = self.scheduler.verify_epoch_token(
-            token, job_id=job.job_id, epoch=job.current_epoch
-        )
-        if payload["generation"] != job.current_generation:
-            raise FenceViolation(
-                f"token generation {payload['generation']} does not match "
-                f"current generation {job.current_generation}"
+    def _check_epoch_token(self, job: Job, token: str | None, *,
+                           operation: str):
+        """校验纪元令牌; 任何失败都先写安全事件再抛出稳定错误。"""
+        try:
+            if not token:
+                raise InvalidToken(
+                    "missing X-Epoch-Token header", reason="missing_token")
+            payload = self.scheduler.verify_epoch_token(
+                token, job_id=job.job_id, epoch=job.current_epoch
             )
-        return payload
+            if payload["generation"] != job.current_generation:
+                raise FenceViolation(
+                    f"token generation {payload['generation']} does not match "
+                    f"current generation {job.current_generation}",
+                    reason="stale_generation",
+                )
+            return payload
+        except (FenceViolation, InvalidToken) as exc:
+            self._record_auth_failure(
+                job.job_id, operation=operation, token=token, exc=exc)
+            raise
 
     def upload_shard(
         self,
@@ -484,7 +553,7 @@ class JobManager:
     ) -> dict:
         job = self.get(job_id)
         with job.lock:
-            self._check_epoch_token(job, epoch_token)
+            self._check_epoch_token(job, epoch_token, operation="upload_shard")
             if job.state != PREEMPTING:
                 raise Conflict(f"job is {job.state}, not accepting shards")
             proc = job.processes.get(rank)
@@ -521,7 +590,8 @@ class JobManager:
         """提交检查点: 全部分片重校验通过才可 COMPLETE。"""
         job = self.get(job_id)
         with job.lock:
-            self._check_epoch_token(job, epoch_token)
+            self._check_epoch_token(
+                job, epoch_token, operation="commit_checkpoint")
             gen = job.current_generation
             cp_before = job.cpm.get(gen)
             if cp_before.state == COMPLETE:
@@ -541,7 +611,8 @@ class JobManager:
         """确认释放资源 — 只有当前纪元检查点 COMPLETE 才允许。"""
         job = self.get(job_id)
         with job.lock:
-            self._check_epoch_token(job, epoch_token)
+            self._check_epoch_token(
+                job, epoch_token, operation="confirm_release")
             gen = job.current_generation
             cp = job.cpm.get(gen)
             if cp.state != COMPLETE:
@@ -579,24 +650,37 @@ class JobManager:
         self,
         job_id: str,
         *,
-        lease_token: str,
+        lease_token: str | None,
         output_id: str,
         data: bytes,
         rank: int | None = None,
     ) -> dict:
-        """提交最终输出。租约栅栏 + (代际, output_id) 幂等双重防护。"""
+        """提交最终输出。租约栅栏 + (代际, output_id) 幂等双重防护。
+
+        授权失败 (撤销/超期/伪造/跨作业/缺失凭证) 一律:
+          1. 写入一条顺序化安全事件 (不含凭证原文, 可跨重启查询);
+          2. 抛出稳定错误 (401 invalid_token / 412 fence_violation);
+          3. 不触碰存储与输出日志 —— 重复并发拒绝不会产生任何结果条目。
+        """
         job = self.get(job_id)
         with job.lock:
             gen = job.output_generation
             try:
+                if not lease_token:
+                    raise InvalidToken(
+                        "missing X-Lease-Token header", reason="missing_token")
                 lease = job.leases.authorize(
                     lease_token, expected_generation=gen
                 )
-            except FenceViolation as exc:
-                digest = hashlib.sha256(data).hexdigest()[:12]
-                job._log("output_fenced", {
-                    "output_id": output_id, "attempted_blob": digest,
-                    "reason": str(exc)})
+            except (FenceViolation, InvalidToken) as exc:
+                self._record_auth_failure(
+                    job_id, operation="append_output", token=lease_token,
+                    exc=exc, extra={"output_id": output_id})
+                if isinstance(exc, FenceViolation):
+                    digest = hashlib.sha256(data).hexdigest()[:12]
+                    job._log("output_fenced", {
+                        "output_id": output_id, "attempted_blob": digest,
+                        "reason": str(exc)})
                 raise
             digest, size, stored_blob = job.store.put(data)
             rec, is_new = job.outputs.append(
@@ -749,6 +833,7 @@ class JobManager:
                 relocated_ranks=relocated,
                 lease=lease.to_dict(),
                 warnings=warnings,
+                security_events=self.security_log.for_job(job_id, limit=50),
             )
             job._last_restore = report
             job._log("restore_verified", {
@@ -786,6 +871,7 @@ class JobManager:
                 if cp else []
             ),
             error=error,
+            security_events=self.security_log.for_job(job.job_id, limit=50),
         )
         job._log("restore_rejected", {"generation": generation, "error": error})
         return report
@@ -820,5 +906,6 @@ class JobManager:
                 "shards": shard_index,
                 "outputs": [r.to_dict() for r in job.outputs.list()],
                 "audit": list(reversed(job.audit)),
+                "security_events": self.security_log.for_job(job_id),
                 "server_ts": time.time(),
             }

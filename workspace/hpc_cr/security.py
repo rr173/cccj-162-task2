@@ -48,26 +48,33 @@ class Signer:
         return f"{TOKEN_VERSION}.{body.decode()}." + self._sign(body)
 
     def verify(self, token: str) -> dict:
-        """验证令牌签名并返回 payload; 任何篡改/版本不符均拒绝。"""
+        """验证令牌签名并返回 payload; 任何篡改/版本不符均拒绝。
+
+        拒绝原因稳定分类: 结构无法解析 -> ``malformed``; 签名不符或
+        载荷不可信 -> ``forged`` (供安全事件日志归档)。
+        """
         try:
             version, body_b64, sig = token.split(".")
         except (AttributeError, ValueError) as exc:
-            raise InvalidToken("malformed token") from exc
+            raise InvalidToken("malformed token", reason="malformed") from exc
         if version != TOKEN_VERSION:
-            raise InvalidToken("unsupported token version")
+            raise InvalidToken("unsupported token version", reason="malformed")
         expected = self._sign(body_b64.encode())
         if not hmac.compare_digest(expected, sig):
-            raise InvalidToken("bad token signature")
+            raise InvalidToken("bad token signature", reason="forged")
         try:
             payload = json.loads(base64.urlsafe_b64decode(body_b64))
         except Exception as exc:  # noqa: BLE001 - 任何解码失败都是伪造令牌
-            raise InvalidToken("undecodable token payload") from exc
+            raise InvalidToken(
+                "undecodable token payload", reason="forged") from exc
         if not isinstance(payload, dict):
-            raise InvalidToken("token payload must be an object")
+            raise InvalidToken(
+                "token payload must be an object", reason="forged")
         return payload
 
     @staticmethod
     def require_fields(payload: dict, fields: tuple[str, ...]) -> None:
         missing = [f for f in fields if f not in payload]
         if missing:
-            raise InvalidToken(f"token missing fields: {','.join(missing)}")
+            raise InvalidToken(
+                f"token missing fields: {','.join(missing)}", reason="forged")

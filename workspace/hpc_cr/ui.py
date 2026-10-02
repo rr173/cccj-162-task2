@@ -1,7 +1,7 @@
 """节点进度页面 (服务端渲染 HTML, 2 秒自动刷新)。
 
 展示: 作业与抢占纪元概览、检查点分片矩阵、节点心跳/失联、进程位点、
-输出条目、审计事件流 (含栅栏拒绝记录)。
+输出条目、安全事件 (授权失败的顺序化持久记录)、审计事件流。
 """
 
 from __future__ import annotations
@@ -113,6 +113,15 @@ def render_progress_page(data: dict) -> str:
         f"<td><small>{_h(a['detail'])}</small></td></tr>"
         for a in audit[:60]
     )
+    sec_rows = "".join(
+        f"<tr><td>{e['seq']}</td><td>{_ts(e['ts'])}</td>"
+        f"<td><code>{_h(e['event'])}</code></td>"
+        f"<td>{_h(e['detail'].get('operation', ''))}</td>"
+        f"<td>{_h(e['detail'].get('reason', ''))}</td>"
+        f"<td><code>{_h(e['detail'].get('token_fingerprint') or '-')}</code></td>"
+        f"<td><small>{_h(e['detail'].get('message', ''))}</small></td></tr>"
+        for e in data.get("security_events", [])[-60:]
+    ) or '<tr><td colspan=7>暂无安全事件</td></tr>'
 
     grace = job.get("epoch_grace_remaining")
     ep_html = ""
@@ -152,6 +161,9 @@ def render_progress_page(data: dict) -> str:
 <h2>已提交输出 (代际隔离, 幂等去重)</h2>
 <table border="1" cellpadding="6"><tr><th>代际</th><th>output_id</th>
 <th>blob</th><th>size</th><th>rank</th><th>时间</th></tr>{out_rows}</table>
+<h2>安全事件 (授权失败 · 顺序化持久记录, 不含凭证原文)</h2>
+<table border="1" cellpadding="6"><tr><th>seq</th><th>时间</th><th>事件</th>
+<th>操作</th><th>原因</th><th>凭证指纹</th><th>详情</th></tr>{sec_rows}</table>
 <h2>审计事件 (最近 60 条)</h2>
 <table border="1" cellpadding="6"><tr><th>时间</th><th>事件</th>
 <th>详情</th></tr>{audit_rows}</table>

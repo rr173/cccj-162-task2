@@ -101,32 +101,39 @@ class LeaseManager:
 
         旧进程迟到写入时 expected_generation 已是新代际 (或旧代际租约已
         REVOKED), 一律抛 FenceViolation, 从根本上阻止双重输出。
+        每种拒绝都带稳定 ``reason`` (cross_job/stale_generation/revoked/
+        expired/unknown_lease), 供安全事件日志归档。
         """
         cur = now or time.time()
         payload = self._sched.verify_lease_token(token)
         if payload["job"] != self.job_id:
-            raise FenceViolation("lease token belongs to another job")
+            raise FenceViolation(
+                "lease token belongs to another job", reason="cross_job")
         if payload["generation"] != expected_generation:
             raise FenceViolation(
                 f"stale output write: token generation "
-                f"{payload['generation']} != current {expected_generation}"
+                f"{payload['generation']} != current {expected_generation}",
+                reason="stale_generation",
             )
         with self._lock:
             lease = self._by_id.get(payload["lease"])
             if lease is None:
-                raise InvalidToken("unknown lease id")
+                raise InvalidToken("unknown lease id", reason="unknown_lease")
             if lease.generation != expected_generation:
-                raise FenceViolation("lease generation mismatch")
+                raise FenceViolation(
+                    "lease generation mismatch", reason="stale_generation")
             if lease.state == REVOKED:
                 raise FenceViolation(
                     f"lease {lease.lease_id} was revoked at preemption; "
-                    "late write from old process rejected"
+                    "late write from old process rejected",
+                    reason="revoked",
                 )
             if lease.state == EXPIRED or lease.expires_ts <= cur:
                 lease.state = EXPIRED
-                raise FenceViolation("output lease expired")
+                raise FenceViolation("output lease expired", reason="expired")
             if cur > payload["until_ts"]:
-                raise FenceViolation("token past its signed expiry")
+                raise FenceViolation(
+                    "token past its signed expiry", reason="expired")
             return lease
 
     def get(self, generation: int) -> Lease:

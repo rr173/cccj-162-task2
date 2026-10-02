@@ -10,11 +10,12 @@
 from __future__ import annotations
 
 import argparse
+import time
 
 from hpc_cr import JobManager
 from hpc_cr.api import build_server
 from hpc_cr.epochs import Scheduler
-from hpc_cr.errors import FenceViolation
+from hpc_cr.errors import FenceViolation, InvalidToken
 from hpc_cr.security import Signer
 
 
@@ -24,8 +25,8 @@ def banner(title: str) -> None:
     print("=" * 72)
 
 
-def run_demo() -> tuple[JobManager, str, str, str]:
-    mgr = JobManager(Scheduler(Signer("demo-secret-key")))
+def run_demo(data_dir: str = "hpc_cr_data") -> tuple[JobManager, str, str, str]:
+    mgr = JobManager(Scheduler(Signer("demo-secret-key")), data_dir=data_dir)
     placement = {0: "n-a", 1: "n-a", 2: "n-b", 3: "n-b"}
     job = mgr.create_job(
         name="climate-simulation", world_size=4, shards_per_rank=2,
@@ -121,6 +122,42 @@ def run_demo() -> tuple[JobManager, str, str, str]:
           f"重试 delivered={out2['delivered']} (幂等不重复)")
     print("输出日志:", [(o["generation"], o["output_id"])
                        for o in mgr.list_outputs("climate-7")])
+
+    banner("7) 无效凭证统一拒绝: 伪造 / 跨作业 / 超期 (稳定错误 + 安全事件)")
+    try:
+        mgr.append_output(
+            "climate-7", lease_token="v1.Zm9yZ2VkLXBheWxvYWQ.deadbeef",
+            output_id="forged-attempt", data=b"forged write")
+    except InvalidToken as exc:
+        print(f"伪造凭证 -> {exc.http_status} {exc.error_code}"
+              f" (reason={exc.reason}):", exc)
+
+    other = mgr.create_job(name="other-job", world_size=1,
+                           job_id="other-1", lease_ttl=0.2)
+    other_token = other.leases.current().token
+    try:
+        mgr.append_output(
+            "climate-7", lease_token=other_token,
+            output_id="cross-job-attempt", data=b"cross job write")
+    except FenceViolation as exc:
+        print(f"跨作业凭证 -> {exc.http_status} {exc.error_code}"
+              f" (reason={exc.reason}):", exc)
+    time.sleep(0.25)  # 等 other-1 的短 TTL 租约超期
+    try:
+        mgr.append_output(
+            "other-1", lease_token=other_token,
+            output_id="expired-attempt", data=b"expired write")
+    except FenceViolation as exc:
+        print(f"超期凭证 -> {exc.http_status} {exc.error_code}"
+              f" (reason={exc.reason}):", exc)
+
+    events = mgr.security_log.for_job("climate-7")
+    print(f"\n安全事件已顺序化落盘 ({data_dir}/security_events.jsonl), "
+          "重启后页面与恢复报告仍可查询:")
+    for e in events:
+        d = e["detail"]
+        print(f"  seq={e['seq']} {e['event']} op={d['operation']}"
+              f" reason={d['reason']} 指纹={d['token_fingerprint']}")
     print("审计事件:", [a["event"] for a in job.audit])
 
     return mgr, "climate-7", token, new_lease
@@ -131,9 +168,11 @@ def main() -> None:
     ap.add_argument("--serve", action="store_true",
                     help="演示后继续运行 HTTP 服务")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--data-dir", default="hpc_cr_data",
+                    help="安全事件持久化目录 (默认 ./hpc_cr_data)")
     args = ap.parse_args()
 
-    mgr, job_id, _, _ = run_demo()
+    mgr, job_id, _, _ = run_demo(data_dir=args.data_dir)
     if not args.serve:
         return
     server = build_server(mgr, host="0.0.0.0", port=args.port, verbose=True)

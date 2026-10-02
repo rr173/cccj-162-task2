@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -35,8 +36,15 @@ def _b64_decode(body: dict, field: str = "data_b64") -> bytes:
         raise ValidationError(f"{field} is not valid base64") from exc
 
 
-def build_default_manager(secret: str = "demo-scheduler-secret") -> JobManager:
-    return JobManager(Scheduler(Signer(secret)))
+def build_default_manager(
+    secret: str = "demo-scheduler-secret",
+    data_dir: str | None = None,
+) -> JobManager:
+    """默认服务管理器: 安全事件持久化到 data_dir (默认 ./hpc_cr_data,
+    可用环境变量 HPC_CR_DATA_DIR 覆盖), 服务重启后仍可查询。"""
+    if data_dir is None:
+        data_dir = os.environ.get("HPC_CR_DATA_DIR", "hpc_cr_data")
+    return JobManager(Scheduler(Signer(secret)), data_dir=data_dir)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -138,20 +146,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_json(body.http_status, body.to_dict())
 
         def epoch_header():
-            tok = self.headers.get("X-Epoch-Token")
-            if not tok:
-                from .errors import InvalidToken
-
-                raise InvalidToken("missing X-Epoch-Token header")
-            return tok
+            # 原样透传 (可能缺失): 由 JobManager 统一判定并记录安全事件
+            return self.headers.get("X-Epoch-Token")
 
         def lease_header():
-            tok = self.headers.get("X-Lease-Token")
-            if not tok:
-                from .errors import InvalidToken
-
-                raise InvalidToken("missing X-Lease-Token header")
-            return tok
+            return self.headers.get("X-Lease-Token")
 
         try:
             if parts == ["api", "jobs"]:

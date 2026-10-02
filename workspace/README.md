@@ -15,6 +15,7 @@
 | 6 | 抢占瞬间吊销旧租约；旧进程迟到写入（旧 generation/已 REVOKED 令牌）返回 `412 FenceViolation`；输出按 `(generation, output_id)` 幂等去重 —— 无双重输出 | `leases.py::authorize`、`storage.py::OutputLog` |
 | 7 | 节点失联：节点与 rank 标记 `LOST`，其分片不被接受、提交被阻塞；心跳恢复后 incarnation+1，补齐方可整体提交 | `jobs.py::mark_node_lost/heartbeat` |
 | 8 | 新一轮抢占使旧的未完成检查点 `SUPERSEDED`；旧纪元令牌不能写新代际 | `checkpoints.py`、`jobs.py` |
+| 9 | 授权失败（撤销/超期/伪造/跨作业凭证）统一返回稳定错误（`error`+`reason`），并写入**不含凭证原文**（仅 sha256 指纹）的**顺序化安全事件**；被拒绝的请求绝不产生结果条目；事件落盘 `data_dir`，服务重启后页面与恢复报告仍可查询 | `events.py`、`jobs.py::append_output/_check_epoch_token` |
 
 ## 状态机
 
@@ -35,15 +36,15 @@
 
 ```bash
 # 测试
-python3 -m unittest discover -s tests -v        # 22 个测试, 含并发竞争
+python3 -m unittest discover -s tests -v        # 31 个测试, 含并发竞争与安全事件
 
-# 端到端演示 (打印恢复验证报告 Markdown)
+# 端到端演示 (打印恢复验证报告 Markdown + 无效凭证拒绝演示)
 python3 demo.py
 # 演示后继续提供 HTTP 服务, 浏览器打开节点进度页
 python3 demo.py --serve --port 8080
 #   http://127.0.0.1:8080/ui/jobs/climate-7
 
-# 空服务
+# 空服务 (安全事件默认持久化到 ./hpc_cr_data, 可用 HPC_CR_DATA_DIR 覆盖)
 python3 -m hpc_cr            # 默认 127.0.0.1:8080
 ```
 
@@ -67,14 +68,27 @@ python3 -m hpc_cr            # 默认 127.0.0.1:8080
 | `action=abandon` | 宽限耗尽放弃，检查点 INCOMPLETE |
 | `action=append_output` + `X-Lease-Token` | 提交输出；旧代际/吊销租约 412；同 output_id 幂等 |
 | `action=restore` `{generation}` | 同代际恢复验证，返回恢复验证报告 + 新租约 |
-| `GET  /api/jobs/{id}/progress.json` | 进度页聚合数据（节点/进程/分片矩阵/输出/审计） |
+| `GET  /api/jobs/{id}/progress.json` | 进度页聚合数据（节点/进程/分片矩阵/输出/审计/**安全事件**） |
 | `GET  /api/jobs/{id}/checkpoints` | 全部代际检查点 |
 | `GET  /api/jobs/{id}/outputs` | 输出条目（按代际隔离） |
-| `GET  /api/jobs/{id}/restore/report` | 最近一次恢复验证报告（JSON） |
-| `GET  /ui/jobs/{id}` | **节点进度页面**（2s 自动刷新） |
+| `GET  /api/jobs/{id}/restore/report` | 最近一次恢复验证报告（JSON，含安全事件） |
+| `GET  /ui/jobs/{id}` | **节点进度页面**（2s 自动刷新，含安全事件区块） |
 
 错误映射：`400` 请求格式、`401` 令牌无效/缺失、`404` 对象不存在、
 `409` 状态冲突（缺片提交/重复分片/状态机）、`412` 栅栏拒绝（旧纪元/旧租约）。
+错误体为 `{"error", "reason", "message"}`：`reason` 是稳定的机器可读分类
+（如 `forged`/`malformed`/`missing_token`/`revoked`/`expired`/`cross_job`/
+`stale_generation`），客户端可据此做程序化处置。
+
+## 安全事件日志（授权失败）
+
+所有凭证校验失败（撤销 `revoked`、超期 `expired`、伪造 `forged`、跨作业
+`cross_job`、缺失/畸形/类型不符等）都会写入一条**顺序化**事件
+（全局单调 `seq`），事件只保留凭证的 sha256 指纹（前 12 位），**绝不记录
+凭证原文**。配置 `data_dir` 后事件以 JSONL 追加落盘
+（`<data_dir>/security_events.jsonl`，flush+fsync），服务重启后自动回放，
+节点进度页面（`/ui/jobs/{id}`、`progress.json`）与恢复验证报告
+（`RestoreReport.security_events`）仍可查询重启前的事件。
 
 ## 恢复验证报告
 
@@ -87,11 +101,16 @@ python3 -m hpc_cr            # 默认 127.0.0.1:8080
 ## 并发正确性
 
 - 每作业一把 `RLock`，加锁顺序固定 Job → 子管理器；CAS 存储独立细锁。
+- 授权失败在触碰存储/输出日志**之前**抛出：任意并发量的无效凭证请求
+  都不会增加结果条目，每次拒绝仅追加一条带唯一 `seq` 的安全事件。
 - 测试 `tests/test_concurrency_api.py` 覆盖：
   - 旧进程迟到写入与恢复后新进程并发提交相同 `output_id` → 旧写入 412、恰好一次落盘；
   - 8 线程并发重复 output / shard → 只有一次 delivered/stored；
   - 未补齐期间并发提交 6 次全部失败，补齐后才 COMPLETE；
   - 失联恢复与提交循环并发 → COMPLETE 最多出现一次且在补齐之后。
+- 测试 `tests/test_security_events.py` 覆盖：伪造/畸形/缺失/撤销/超期/
+  跨作业凭证的稳定错误与事件落盘、8 线程并发拒绝零结果条目、
+  重启后页面与恢复报告仍可查询事件。
 
 ## 代码结构
 
@@ -102,9 +121,10 @@ hpc_cr/
   storage.py      # 内容寻址 blob 存储 + 输出去重日志
   checkpoints.py  # 分片、检查点状态机、全量重校验提交
   leases.py       # 输出租约与代际栅栏
+  events.py       # 顺序化安全事件日志 (授权失败, JSONL 持久化, 无凭证原文)
   jobs.py         # Job/JobManager 聚合根、恢复验证报告
   api.py          # stdlib ThreadingHTTPServer JSON API
   ui.py           # 节点进度页面 HTML 渲染
-tests/            # 22 个单元/并发/HTTP 测试
+tests/            # 31 个单元/并发/HTTP/安全事件测试
 demo.py           # 端到端场景脚本
 ```

@@ -24,6 +24,9 @@ from .security import Signer
 class InvalidTokenType(InvalidToken):
     """令牌类型与操作不匹配 (epoch 令牌/lease 令牌混用)。"""
 
+    def __init__(self, message: str = "wrong token type"):
+        super().__init__(message, reason="wrong_token_type")
+
 
 @dataclass
 class PreemptionEpoch:
@@ -125,11 +128,17 @@ class Scheduler:
         Signer.require_fields(payload, ("typ", "job", "epoch", "generation"))
         if payload["typ"] != "epoch":
             raise InvalidTokenType("epoch token required")
-        if payload["job"] != job_id or payload["epoch"] != epoch:
-
+        if payload["job"] != job_id:
             raise FenceViolation(
-                f"epoch token binds job={payload['job']} epoch="
-                f"{payload['epoch']}, expected job={job_id} epoch={epoch}"
+                f"epoch token belongs to job {payload['job']}, "
+                f"not {job_id}",
+                reason="cross_job",
+            )
+        if payload["epoch"] != epoch:
+            raise FenceViolation(
+                f"epoch token is for epoch {payload['epoch']}, "
+                f"current epoch is {epoch}",
+                reason="stale_epoch",
             )
         return payload
 

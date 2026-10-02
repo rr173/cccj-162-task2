@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from .epochs import Scheduler
 from .errors import CpError
 from .jobs import JobManager
+from .persistence import load_or_create_secret
 from .security import Signer
 from .ui import render_progress_page
 
@@ -35,8 +36,18 @@ def _b64_decode(body: dict, field: str = "data_b64") -> bytes:
         raise ValidationError(f"{field} is not valid base64") from exc
 
 
-def build_default_manager(secret: str = "demo-scheduler-secret") -> JobManager:
-    return JobManager(Scheduler(Signer(secret)))
+def build_default_manager(
+    secret: str | None = None, data_dir: str | None = None
+) -> JobManager:
+    """构造默认管理器。
+
+    secret 缺省时: 持久化模式 (data_dir 给定) 从环境变量/密钥文件加载,
+    保证重启后 HMAC 密钥一致、旧令牌仍可验证; 纯内存模式用固定演示密钥。
+    """
+    if secret is None:
+        secret = (load_or_create_secret(data_dir)
+                  if data_dir is not None else "demo-scheduler-secret")
+    return JobManager(Scheduler(Signer(secret)), data_dir=data_dir)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -118,11 +129,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     and parts[3] == "outputs":
                 return self._handle(
                     lambda jid=parts[2]: {"outputs": self.mgr.list_outputs(jid)})
+            if len(parts) == 4 and parts[:2] == ["api", "jobs"] \
+                    and parts[3] == "security-events":
+                return self._handle(lambda jid=parts[2]: {
+                    "security_events": self.mgr.security_events(jid)})
             if len(parts) == 5 and parts[:2] == ["api", "jobs"] \
                     and parts[3:] == ["restore", "report"]:
                 return self._handle(
                     lambda jid=parts[2]:
-                        self.mgr.last_restore_report(jid).to_dict())
+                        self.mgr.last_restore_report_dict(jid))
             if parts[:1] == ["ui"] and len(parts) == 3 and parts[1] == "jobs":
                 data = self.mgr.progress_page_data(parts[2])
                 return self._html(
@@ -138,20 +153,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._send_json(body.http_status, body.to_dict())
 
         def epoch_header():
-            tok = self.headers.get("X-Epoch-Token")
-            if not tok:
-                from .errors import InvalidToken
-
-                raise InvalidToken("missing X-Epoch-Token header")
-            return tok
+            # 缺失凭证交由 JobManager 统一归类 (401 missing_token) 并写入
+            # 安全事件, 与输出租约路径保持一致。
+            return self.headers.get("X-Epoch-Token")
 
         def lease_header():
-            tok = self.headers.get("X-Lease-Token")
-            if not tok:
-                from .errors import InvalidToken
-
-                raise InvalidToken("missing X-Lease-Token header")
-            return tok
+            # 缺失凭证交由 JobManager 统一归类 (401 missing_token) 并写入
+            # 安全事件, 因此这里返回 None 而不是直接拒绝。
+            return self.headers.get("X-Lease-Token")
 
         try:
             if parts == ["api", "jobs"]:
@@ -191,7 +200,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._handle(lambda: self.mgr.report_progress(
                     jid, int(body["rank"]), int(body["input_pos"])))
             if action == "upload_shard":
-                data = _b64_decode(body)
                 return self._handle(lambda: self.mgr.upload_shard(
                     jid,
                     epoch_token=epoch_header(),
@@ -199,7 +207,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     index=int(body.get("index", 0)),
                     node=body["node"],
                     input_pos=int(body["input_pos"]),
-                    data=data,
+                    data=_b64_decode(body),
                 ))
             if action == "commit_checkpoint":
                 return self._handle(lambda: self.mgr.commit_checkpoint(
@@ -211,12 +219,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._handle(lambda: self.mgr.abort_epoch(
                     jid, reason=body.get("reason", "grace_expired")))
             if action == "append_output":
-                data = _b64_decode(body)
                 return self._handle(lambda: self.mgr.append_output(
                     jid,
                     lease_token=lease_header(),
                     output_id=body["output_id"],
-                    data=data,
+                    data=_b64_decode(body),
                     rank=body.get("rank"),
                 ))
             if action == "restore":
@@ -272,8 +279,9 @@ def build_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     verbose: bool = False,
+    data_dir: str | None = None,
 ) -> ThreadingHTTPServer:
-    manager = manager or build_default_manager()
+    manager = manager or build_default_manager(data_dir=data_dir)
 
     class _Handler(ApiHandler):
         pass
@@ -287,10 +295,14 @@ def build_server(
 
 
 def serve_forever(host: str = "127.0.0.1", port: int = 8080,
-                  verbose: bool = False) -> None:  # pragma: no cover
-    server = build_server(host=host, port=port, verbose=verbose)
+                  verbose: bool = False,
+                  data_dir: str | None = None) -> None:  # pragma: no cover
+    server = build_server(host=host, port=port, verbose=verbose,
+                          data_dir=data_dir)
     print(f"HPC checkpoint service on http://{host}:{port}  "
           f"(UI: http://{host}:{port}/ui/jobs/<job_id>)")
+    if data_dir:
+        print(f"persistent data directory: {data_dir}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

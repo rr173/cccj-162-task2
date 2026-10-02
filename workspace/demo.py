@@ -14,7 +14,7 @@ import argparse
 from hpc_cr import JobManager
 from hpc_cr.api import build_server
 from hpc_cr.epochs import Scheduler
-from hpc_cr.errors import FenceViolation
+from hpc_cr.errors import FenceViolation, InvalidToken
 from hpc_cr.security import Signer
 
 
@@ -24,12 +24,18 @@ def banner(title: str) -> None:
     print("=" * 72)
 
 
-def run_demo() -> tuple[JobManager, str, str, str]:
-    mgr = JobManager(Scheduler(Signer("demo-secret-key")))
+def run_demo(data_dir: str | None = None) -> tuple[JobManager, str, str, str]:
+    from hpc_cr.security import Signer as _S
+    secret = "demo-secret-key"
+    mgr = JobManager(Scheduler(_S(secret)), data_dir=data_dir)
     placement = {0: "n-a", 1: "n-a", 2: "n-b", 3: "n-b"}
-    job = mgr.create_job(
-        name="climate-simulation", world_size=4, shards_per_rank=2,
-        rank_nodes=placement, job_id="climate-7", lease_ttl=600)
+    try:
+        job = mgr.create_job(
+            name="climate-simulation", world_size=4, shards_per_rank=2,
+            rank_nodes=placement, job_id="climate-7", lease_ttl=600)
+    except Exception:  # noqa: BLE001 - 持久化目录重跑时作业已存在
+        job = mgr.get("climate-7")
+        return mgr, "climate-7", "", job.leases.current().token
     print(f"创建作业 climate-7 (4 进程 × 2 分片), 节点: {placement}")
 
     # 进程持续推进输入位点
@@ -105,8 +111,12 @@ def run_demo() -> tuple[JobManager, str, str, str]:
             output_id="climate-output-0001",
             data=b"late write from preempted process")
         print("!! 旧进程写入竟然成功 (错误)")
-    except FenceViolation as exc:
-        print("旧进程迟到写入被栅栏拒绝 (412):", exc)
+    except (FenceViolation, InvalidToken) as exc:
+        print(f"旧进程迟到写入被拒绝 ({exc.http_status}/"
+              f"{exc.error_code}/{exc.reason}): {exc}")
+        sec = mgr.security_events("climate-7")
+        print("已写入安全事件 seq:", [e["seq"] for e in sec],
+              "原因:", [e["reason"] for e in sec])
 
     new_lease = job.leases.current().token
     out1 = mgr.append_output(
@@ -131,9 +141,11 @@ def main() -> None:
     ap.add_argument("--serve", action="store_true",
                     help="演示后继续运行 HTTP 服务")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--data-dir", default=None,
+                    help="持久化数据目录; 给定后重启仍可查询作业/安全事件")
     args = ap.parse_args()
 
-    mgr, job_id, _, _ = run_demo()
+    mgr, job_id, _, _ = run_demo(data_dir=args.data_dir)
     if not args.serve:
         return
     server = build_server(mgr, host="0.0.0.0", port=args.port, verbose=True)

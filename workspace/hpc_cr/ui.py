@@ -113,6 +113,18 @@ def render_progress_page(data: dict) -> str:
         f"<td><small>{_h(a['detail'])}</small></td></tr>"
         for a in audit[:60]
     )
+    security = data.get("security_events") or []
+    sec_rows = "".join(
+        f"<tr><td>{_h(e.get('seq'))}</td><td>{_ts(e['ts'])}</td>"
+        f"<td><code>{_h(e.get('credential'))}</code></td>"
+        f"<td><code>{_h(e.get('operation'))}</code></td>"
+        f"<td>{_h(e.get('reason'))}</td>"
+        f"<td>{_h(e.get('http_status'))}</td>"
+        f"<td>{_h(e.get('expected_generation'))}</td>"
+        f"<td><small>{_h(e.get('output_id', ''))} "
+        f"{_h(e.get('claimed', {}))}</small></td></tr>"
+        for e in security[:100]
+    ) or '<tr><td colspan=8>暂无安全事件</td></tr>'
 
     grace = job.get("epoch_grace_remaining")
     ep_html = ""
@@ -152,6 +164,12 @@ def render_progress_page(data: dict) -> str:
 <h2>已提交输出 (代际隔离, 幂等去重)</h2>
 <table border="1" cellpadding="6"><tr><th>代际</th><th>output_id</th>
 <th>blob</th><th>size</th><th>rank</th><th>时间</th></tr>{out_rows}</table>
+<h2>安全事件 — 授权失败 (顺序化, 不含凭证原文)</h2>
+<p><small>共 {len(security)} 条, 显示最近 100 条 ·
+<a href="/api/jobs/{_h(job['job_id'])}/security-events">JSON</a></small></p>
+<table border="1" cellpadding="6"><tr><th>seq</th><th>时间</th>
+<th>凭证类型</th><th>操作</th><th>原因</th><th>HTTP</th>
+<th>期望代际</th><th>目标/声明绑定</th></tr>{sec_rows}</table>
 <h2>审计事件 (最近 60 条)</h2>
 <table border="1" cellpadding="6"><tr><th>时间</th><th>事件</th>
 <th>详情</th></tr>{audit_rows}</table>

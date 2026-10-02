@@ -93,9 +93,14 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertEqual(outputs[0]["generation"], 1)
         self.assertEqual(
             self.mgr.store.get(outputs[0]["blob"]), b"NEW OUTPUT")
-        # 审计里留有栅栏拒绝证据
+        # 审计里留有授权拒绝安全事件证据, 且不含凭证原文
         events = [a["event"] for a in self.mgr.get("par-1").audit]
-        self.assertIn("output_fenced", events)
+        self.assertIn("security_authz_denied", events)
+        sec = self.mgr.security_events("par-1")
+        self.assertEqual(sec[-1]["reason"], "stale_generation")
+        leaked = [e for e in sec if "token" in json.dumps(
+            {k: v for k, v in e.items() if k != "type"})]
+        self.assertEqual(leaked, [])
 
     def test_concurrent_duplicate_output_idempotent_not_double(self):
         outcomes = []
@@ -324,8 +329,11 @@ class HttpApiTest(unittest.TestCase):
         st, prog = self._req("GET", "/api/jobs/http-1/progress.json")
         self.assertEqual(st, 200)
         self.assertEqual(len(prog["shards"]), 2)
-        self.assertIn("output_fenced",
+        self.assertIn("security_authz_denied",
                       [a["event"] for a in prog["audit"]])
+        # 授权失败有稳定错误码/原因, 响应不回显凭证
+        self.assertEqual(fenced["reason"], "stale_generation")
+        self.assertNotIn(old_lease_token, json.dumps(fenced))
 
         # HTML 进度页可访问
         with urllib.request.urlopen(

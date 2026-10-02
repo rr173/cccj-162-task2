@@ -48,26 +48,36 @@ class Signer:
         return f"{TOKEN_VERSION}.{body.decode()}." + self._sign(body)
 
     def verify(self, token: str) -> dict:
-        """验证令牌签名并返回 payload; 任何篡改/版本不符均拒绝。"""
+        """验证令牌签名并返回 payload; 任何篡改/版本不符均拒绝。
+
+        所有拒绝都带稳定 reason 码, 消息固定且不含令牌原文。
+        """
         try:
             version, body_b64, sig = token.split(".")
-        except (AttributeError, ValueError) as exc:
-            raise InvalidToken("malformed token") from exc
+        except (AttributeError, ValueError, TypeError) as exc:
+            raise InvalidToken("malformed credential",
+                               reason="malformed_token") from exc
         if version != TOKEN_VERSION:
-            raise InvalidToken("unsupported token version")
+            raise InvalidToken("unsupported credential version",
+                               reason="bad_token_version")
         expected = self._sign(body_b64.encode())
         if not hmac.compare_digest(expected, sig):
-            raise InvalidToken("bad token signature")
+            raise InvalidToken("invalid credential signature",
+                               reason="bad_signature")
         try:
             payload = json.loads(base64.urlsafe_b64decode(body_b64))
         except Exception as exc:  # noqa: BLE001 - 任何解码失败都是伪造令牌
-            raise InvalidToken("undecodable token payload") from exc
+            raise InvalidToken("undecodable credential payload",
+                               reason="undecodable_payload") from exc
         if not isinstance(payload, dict):
-            raise InvalidToken("token payload must be an object")
+            raise InvalidToken("credential payload must be an object",
+                               reason="bad_payload")
         return payload
 
     @staticmethod
     def require_fields(payload: dict, fields: tuple[str, ...]) -> None:
         missing = [f for f in fields if f not in payload]
         if missing:
-            raise InvalidToken(f"token missing fields: {','.join(missing)}")
+            # 只暴露字段名, 不暴露 payload 内容
+            raise InvalidToken("credential is missing required fields",
+                               reason="missing_fields")

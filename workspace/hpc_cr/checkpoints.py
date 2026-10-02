@@ -284,3 +284,70 @@ class CheckpointManager:
                 {k: v for k, v in cp.manifest.items() if k != "manifest_digest"}
             ).hex()[:32]
             return cp
+
+    # ------------------------------------------------------- replay support
+    def restore_after_preempt(
+        self,
+        *,
+        epoch: int,
+        generation: int,
+        world_size: int,
+        shards_per_rank: int,
+        created_ts: float,
+        processes: list[tuple[int, str]] | None = None,
+    ) -> Checkpoint:
+        """事件重放: 抢占事件对应的 PENDING 检查点骨架。
+
+        若该代际已有检查点 (重放幂等) 直接返回。分片/完成状态由后续
+        shard_uploaded / checkpoint_complete 事件补齐。
+        """
+        with self._lock:
+            existing = self._cps.get(generation)
+            if existing is not None:
+                return existing
+            cp = Checkpoint(
+                job_id=self.job_id,
+                epoch=epoch,
+                generation=generation,
+                world_size=world_size,
+                shards_per_rank=shards_per_rank,
+                processes=tuple(sorted(processes or [])),
+                created_ts=created_ts,
+            )
+            self._cps[generation] = cp
+            return cp
+
+    def restore_shard(
+        self,
+        *,
+        generation: int,
+        rank: int,
+        index: int,
+        node: str,
+        blob: str,
+        size: int,
+        input_pos: int,
+        uploaded_ts: float,
+    ) -> None:
+        """事件重放: 按已提交事实回填分片 (不触碰 blob 存储, blob 独立持久)。"""
+        with self._lock:
+            cp = self.get(generation)
+            cp.shards[shard_id(rank, index)] = Shard(
+                rank=rank, index=index, node=node, blob=blob, size=size,
+                input_pos=input_pos, uploaded_ts=uploaded_ts)
+
+    def restore_complete(
+        self, generation: int, *, completed_ts: float,
+        manifest: dict | None = None,
+    ) -> None:
+        """事件重放: 检查点进入 COMPLETE, 复用持久化清单。
+
+        重放不重新校验 blob (重启后 blob 同样持久, 恢复/提交路径会再做
+        全量重校验); 但缺失 blob 的场景下不影响状态重建。
+        """
+        with self._lock:
+            cp = self.get(generation)
+            cp.state = COMPLETE
+            cp.completed_ts = completed_ts
+            if manifest is not None:
+                cp.manifest = manifest

@@ -20,9 +20,17 @@ from dataclasses import dataclass, field
 from .errors import Conflict, FenceViolation, InvalidToken
 from .security import Signer
 
+# 纪元令牌授权失败的稳定原因码
+REASON_EPOCH_CROSS = "epoch_cross_job_or_epoch"
+REASON_EPOCH_STALE_GENERATION = "stale_generation"
+
 
 class InvalidTokenType(InvalidToken):
     """令牌类型与操作不匹配 (epoch 令牌/lease 令牌混用)。"""
+
+    def __init__(self, message: str = "credential type mismatch", **kw):
+        super().__init__(message, reason=kw.pop("reason", "wrong_token_type"),
+                         **kw)
 
 
 @dataclass
@@ -120,17 +128,24 @@ class Scheduler:
     def verify_epoch_token(
         self, token: str, *, job_id: str, epoch: int
     ) -> dict:
-        """验证进程组出示的纪元令牌与当前操作的 job/epoch 绑定一致。"""
+        """验证进程组出示的纪元令牌与当前操作的 job/epoch 绑定一致。
+
+        失败均带稳定 reason 与固定消息, 不回显令牌内容。
+        """
         payload = self._signer.verify(token)
         Signer.require_fields(payload, ("typ", "job", "epoch", "generation"))
         if payload["typ"] != "epoch":
-            raise InvalidTokenType("epoch token required")
+            raise InvalidTokenType()
         if payload["job"] != job_id or payload["epoch"] != epoch:
-
-            raise FenceViolation(
-                f"epoch token binds job={payload['job']} epoch="
-                f"{payload['epoch']}, expected job={job_id} epoch={epoch}"
+            deny = FenceViolation(
+                "epoch credential is not valid for this job epoch",
+                reason=REASON_EPOCH_CROSS,
             )
+            deny.claimed = {
+                "job": payload.get("job"), "epoch": payload.get("epoch"),
+                "expected_job": job_id, "expected_epoch": epoch,
+            }
+            raise deny
         return payload
 
     def issue_lease_token(
@@ -153,13 +168,49 @@ class Scheduler:
 
     def verify_lease_token(self, token: str) -> dict:
         payload = self._signer.verify(token)
-        Signer.require_fields(
-            payload, ("typ", "job", "generation", "lease", "until_ts")
-        )
+        Signer.require_fields(payload, ("typ", "job", "generation"))
+        # 类型不符 (epoch 令牌冒充租约令牌) 优先稳定归类为 wrong_token_type,
+        # 而不是让后续缺字段检查报出语义不清的 missing_fields。
         if payload["typ"] != "lease":
-            raise InvalidTokenType("lease token required")
+            raise InvalidTokenType()
+        Signer.require_fields(payload, ("lease", "until_ts"))
         return payload
 
     @property
     def signer(self) -> Signer:
         return self._signer
+
+    # -------------------------------------------------------- replay support
+    def restore_epoch(self, ep_dict: dict) -> PreemptionEpoch:
+        """事件重放: 按持久化事实重建调度器侧单调水位与当前纪元。
+
+        令牌不入库, 这里用同一密钥按绑定字段重新签发等价令牌 (payload
+        完全一致, 签名也一致), 因此重启后旧令牌可继续被验证/栅栏。
+        """
+        with self._lock:
+            st = self._state.setdefault(
+                ep_dict["job_id"], {"epoch": 0, "generation": 0})
+            st["epoch"] = max(st["epoch"], ep_dict["epoch"])
+            st["generation"] = max(st["generation"], ep_dict["generation"])
+            ep = PreemptionEpoch(
+                job_id=ep_dict["job_id"],
+                epoch=ep_dict["epoch"],
+                generation=ep_dict["generation"],
+                reason=ep_dict["reason"],
+                kind=ep_dict["kind"],
+                nodes=tuple(ep_dict.get("nodes", ())),
+                deadline_ts=ep_dict["deadline_ts"],
+                grace_seconds=ep_dict["grace_seconds"],
+                issued_ts=ep_dict["issued_ts"],
+            )
+            ep.token = self._signer.issue(
+                {
+                    "typ": "epoch",
+                    "job": ep.job_id,
+                    "epoch": ep.epoch,
+                    "generation": ep.generation,
+                    "deadline_ts": ep.deadline_ts,
+                }
+            )
+            st["epoch_obj"] = ep
+            return ep

@@ -2,10 +2,16 @@
 
 线程模型: 每个 Job 一把 RLock; 子管理器 (CheckpointManager/LeaseManager)
 各有内部锁, 加锁顺序固定为 Job -> 子管理器, 避免死锁。
+
+持久化: 所有状态变更通过 JobManager._emit 追加为顺序化事件 (单调 seq,
+见 persistence.Journal); 服务重启后 _replay() 严格按 seq 重放重建作业、
+检查点、租约、输出条目、审计与 **安全事件**。凭证令牌从不入库 (自描述
+可验, 重放时用同一 HMAC 密钥重新派生)。
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import threading
 import time
@@ -19,8 +25,16 @@ from .checkpoints import (
     shard_id,
 )
 from .epochs import Scheduler
-from .errors import Conflict, FenceViolation, NotFound, ValidationError
+from .errors import (
+    Conflict,
+    CpError,
+    FenceViolation,
+    InvalidToken,
+    NotFound,
+    ValidationError,
+)
 from .leases import LeaseManager
+from .persistence import Journal
 from .storage import ContentStore, OutputLog
 
 # 作业状态
@@ -35,6 +49,9 @@ LOST = "LOST"
 UP = "UP"
 
 AUDIT_LIMIT = 500
+
+# 统一安全事件名 (审计流 + 持久化事件类型共用)
+SECURITY_DENIED = "security_authz_denied"
 
 
 @dataclass
@@ -96,6 +113,9 @@ class RestoreReport:
     lease: dict | None = None
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
+    # 截至报告生成时该作业的安全事件 (授权拒绝证据), 随报告持久化,
+    # 重启后仍可在验证报告中查询; 读取接口会补充报告之后的新事件。
+    security_events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +136,7 @@ class RestoreReport:
             "lease": self.lease,
             "warnings": list(self.warnings),
             "error": self.error,
+            "security_events": list(self.security_events),
         }
 
     def to_markdown(self) -> str:
@@ -179,6 +200,21 @@ def render_report_md(r: RestoreReport) -> str:
     if r.warnings:
         lines += ["", "## 警告", ""]
         lines += [f"- {w}" for w in r.warnings]
+    if r.security_events:
+        lines += [
+            "",
+            f"## 安全事件 (截至报告生成, {len(r.security_events)} 条)",
+            "",
+            "| seq | 时间 | 凭证 | 操作 | 原因 |",
+            "|---|---|---|---|---|",
+        ]
+        for e in r.security_events:
+            lines.append(
+                f"| {e.get('seq', '-')} | "
+                f"{time.strftime('%H:%M:%S', time.localtime(e['ts']))} | "
+                f"{e.get('credential', '-')} | {e.get('operation', '-')} | "
+                f"{e.get('reason', '-')} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -193,6 +229,7 @@ class Job:
         rank_nodes: dict[int, str],
         store: ContentStore,
         scheduler: Scheduler,
+        manager: "JobManager",
         now: float | None = None,
         lease_ttl: float = 300.0,
     ):
@@ -204,14 +241,18 @@ class Job:
         self.state = RUNNING
         self.store = store
         self.scheduler = scheduler
+        self.mgr = manager
         self.lock = threading.RLock()
 
         self.nodes: dict[str, Node] = {}
         self.processes: dict[int, Process] = {}
         for rank in range(world_size):
             node = rank_nodes[rank]
-            self.processes[rank] = Process(rank=rank, node=node)
-            n = self.nodes.setdefault(node, Node(node_id=node))
+            self.processes[rank] = Process(
+                rank=rank, node=node, last_heartbeat=self.created_ts,
+                last_progress_ts=self.created_ts)
+            n = self.nodes.setdefault(node, Node(
+                node_id=node, last_heartbeat=self.created_ts))
             if rank not in n.ranks:
                 n.ranks.append(rank)
 
@@ -231,15 +272,14 @@ class Job:
         self._last_restore: RestoreReport | None = None
         self._lease_ttl = lease_ttl
 
-        # 初始代际 gen0 的输出租约
-        lease = self.leases.grant(0, lease_ttl)
-        self._log("lease_granted", {"generation": 0, "lease_id": lease.lease_id})
+        # 初始代际 gen0 的输出租约 (事件由 JobManager.create_job 统一发出)
+        self.leases.grant(0, lease_ttl)
 
     # ------------------------------------------------------------- utility
-    def _log(self, event: str, detail: dict | None = None, ts: float | None = None):
-        self.audit.append({"ts": ts or time.time(), "event": event, "detail": detail or {}})
-        if len(self.audit) > AUDIT_LIMIT:
-            del self.audit[:-AUDIT_LIMIT]
+    def _log(self, event: str, detail: dict | None = None,
+             ts: float | None = None):
+        """审计事件入口: 实时模式追加顺序化日志, 重放模式仅追加内存审计。"""
+        return self.mgr._record(self.job_id, event, detail or {}, ts=ts)
 
     def epoch_info(self):
         return self.scheduler.current_epoch(self.job_id)
@@ -274,17 +314,67 @@ class Job:
                 "active_lease": self.leases.current().to_dict()
                 if self.leases.current() else None,
                 "outputs_total": len(self.outputs.list()),
+                "security_events_total": len(
+                    self.mgr.security_events(self.job_id)),
             }
 
 
 class JobManager:
-    """作业注册表 + 全部编排用例。"""
+    """作业注册表 + 全部编排用例。
 
-    def __init__(self, scheduler: Scheduler):
+    data_dir 为 None 时纯内存 (测试/临时演示); 给定目录则事件顺序化落盘,
+    构造时自动重放, 服务重启后作业/检查点/租约/输出/审计/安全事件均可
+    查询且可继续写入。
+    """
+
+    def __init__(self, scheduler: Scheduler, data_dir: str | None = None):
         self.scheduler = scheduler
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
-        self.store = ContentStore()
+        self.journal = Journal(data_dir)
+        self.store = ContentStore(data_dir)
+        self._security: list[dict] = []
+        self._recording = False
+        self._replay()
+        self._recording = True
+
+    # ===================================================== event plumbing
+    def _record(
+        self, job_id: str, event: str, detail: dict, *,
+        ts: float | None = None,
+    ) -> dict:
+        """追加一条审计事件; 实时模式同时落盘 (顺序化), 重放模式只入内存。
+
+        安全事件 (SECURITY_DENIED) 额外进入全局安全事件流。detail 必须
+        JSON 可序列化且不含任何凭证原文。
+        """
+        detail = dict(detail)
+        # job_id 作为每条事件的顶层路由字段, 重放据此归属到作业
+        detail["job_id"] = job_id
+        detail.setdefault("ts", ts or time.time())
+        if self._recording:
+            evt = self.journal.append(event, detail)
+        else:
+            evt = {"seq": None, "ts": detail["ts"], "type": event,
+                   **{k: v for k, v in detail.items() if k != "ts"}}
+        job = self._jobs.get(job_id)
+        if job is not None:
+            job.audit.append({"ts": evt["ts"], "event": event,
+                              "detail": {k: v for k, v in evt.items()
+                                         if k not in ("seq", "ts", "type")}})
+            if len(job.audit) > AUDIT_LIMIT:
+                del job.audit[:-AUDIT_LIMIT]
+        if event == SECURITY_DENIED:
+            self._security.append(evt)
+        return evt
+
+    def security_events(self, job_id: str | None = None) -> list[dict]:
+        """按 seq 顺序返回安全事件 (可按作业过滤)。"""
+        with self._lock:
+            events = list(self._security)
+        if job_id is not None:
+            events = [e for e in events if e.get("job_id") == job_id]
+        return sorted(events, key=lambda e: e.get("seq") or 0)
 
     # ------------------------------------------------------------ create
     def create_job(
@@ -316,10 +406,22 @@ class JobManager:
                 rank_nodes=rank_nodes,
                 store=self.store,
                 scheduler=self.scheduler,
+                manager=self,
                 lease_ttl=lease_ttl,
             )
             self._jobs[job_id] = job
-            job._log("job_created", {"name": name, "world_size": world_size})
+            self._record(job_id, "job_created", {
+                "name": name, "world_size": world_size,
+                "shards_per_rank": shards_per_rank,
+                "rank_nodes": {str(r): n for r, n in rank_nodes.items()},
+                "lease_ttl": lease_ttl, "created_ts": job.created_ts,
+            }, ts=job.created_ts)
+            lease = job.leases.get(0)
+            self._record(job_id, "lease_granted", {
+                "generation": 0, "lease_id": lease.lease_id,
+                "issued_ts": lease.issued_ts, "expires_ts": lease.expires_ts,
+                "state": lease.state,
+            }, ts=lease.issued_ts)
             return job
 
     def get(self, job_id: str) -> Job:
@@ -331,6 +433,40 @@ class JobManager:
     def list_jobs(self) -> list[Job]:
         with self._lock:
             return list(self._jobs.values())
+
+    # -------------------------------------------------- security denials
+    def _deny(
+        self,
+        job: Job,
+        exc: CpError,
+        *,
+        credential: str,
+        operation: str,
+        expected_generation: int,
+        output_id: str | None = None,
+        data: bytes | None = None,
+    ) -> dict:
+        """统一记录一次授权失败: 稳定 reason + 只含安全字段, 无凭证原文。"""
+        if isinstance(exc, InvalidToken):
+            default_reason = "invalid_credential"
+        else:
+            default_reason = "not_authorized"
+        record = {
+            "job_id": job.job_id,
+            "credential": credential,         # output_lease | epoch_token
+            "operation": operation,
+            "reason": getattr(exc, "reason", None) or default_reason,
+            "http_status": exc.http_status,
+            "error": exc.error_code,
+            "expected_generation": expected_generation,
+            "claimed": getattr(exc, "claimed", None) or {},
+        }
+        if output_id is not None:
+            record["output_id"] = output_id
+        if data is not None:
+            # 输出载荷摘要不是凭证; 只取短摘要用于关联, 令牌本身绝不记录
+            record["attempted_blob"] = hashlib.sha256(data).hexdigest()[:12]
+        return self._record(job.job_id, SECURITY_DENIED, record)
 
     # ---------------------------------------------------------- preempt
     def preempt(
@@ -390,12 +526,20 @@ class JobManager:
                 shards_per_rank=job.shards_per_rank,
                 processes=[job.processes[r].to_dict() for r in
                            sorted(job.processes)],
+                now=ep.issued_ts,
             )
             # 抢占瞬间吊销当前输出租约: 旧进程的迟到写入立即失去资格
             revoked = job.leases.revoke_generation(job.output_generation)
+            if revoked is not None and revoked.state == "REVOKED":
+                self._record(job_id, "lease_revoked", {
+                    "generation": revoked.generation,
+                    "lease_id": revoked.lease_id,
+                    "revoked_ts": revoked.revoked_ts,
+                }, ts=revoked.revoked_ts)
             job._log(
                 "preempt_issued",
                 {
+                    "epoch_obj": ep.to_dict(),
                     "epoch": ep.epoch,
                     "generation": ep.generation,
                     "kind": kind,
@@ -422,15 +566,20 @@ class JobManager:
             if node is None:
                 raise NotFound(f"unknown node {node_id}")
             node.last_heartbeat = ts
+            recovered = False
             if node.state == LOST:
                 node.state = UP
-                job._log("node_recovered", {"node": node_id})
+                recovered = True
             for rank in node.ranks:
                 proc = job.processes[rank]
                 proc.last_heartbeat = ts
                 if proc.state == LOST:
                     proc.state = ALIVE
                     proc.incarnation += 1
+            if recovered:
+                job._log("node_recovered", {"node": node_id}, ts=ts)
+            else:
+                job._log("node_heartbeat", {"node": node_id}, ts=ts)
             return node.to_dict()
 
     def report_progress(self, job_id: str, rank: int, input_pos: int):
@@ -439,8 +588,11 @@ class JobManager:
             proc = job.processes.get(rank)
             if proc is None:
                 raise NotFound(f"unknown rank {rank}")
+            ts = time.time()
             proc.last_input_pos = input_pos
-            proc.last_progress_ts = time.time()
+            proc.last_progress_ts = ts
+            job._log("progress_reported", {"rank": rank,
+                                           "input_pos": input_pos}, ts=ts)
             return proc.to_dict()
 
     def mark_node_lost(self, job_id: str, node_id: str):
@@ -460,16 +612,37 @@ class JobManager:
             return {"node": node.to_dict(), "lost_ranks": lost_ranks}
 
     # ------------------------------------------------------- shard write
-    def _check_epoch_token(self, job: Job, token: str):
-        payload = self.scheduler.verify_epoch_token(
-            token, job_id=job.job_id, epoch=job.current_epoch
-        )
-        if payload["generation"] != job.current_generation:
-            raise FenceViolation(
-                f"token generation {payload['generation']} does not match "
-                f"current generation {job.current_generation}"
+    def _check_epoch_token(self, job: Job, token: str | None, *,
+                           operation: str):
+        if not token:
+            from .leases import REASON_MISSING_TOKEN, stable_denial
+            deny = InvalidToken(
+                stable_denial(REASON_MISSING_TOKEN, credential="epoch_token"),
+                reason=REASON_MISSING_TOKEN)
+            self._deny(job, deny, credential="epoch_token",
+                       operation=operation,
+                       expected_generation=job.current_generation)
+            raise deny
+        try:
+            payload = self.scheduler.verify_epoch_token(
+                token, job_id=job.job_id, epoch=job.current_epoch
             )
-        return payload
+            if payload["generation"] != job.current_generation:
+                deny = FenceViolation(
+                    "epoch credential is not valid for the current generation",
+                    reason="stale_generation")
+                deny.claimed = {
+                    "generation": payload.get("generation"),
+                    "expected_generation": job.current_generation}
+                raise deny
+            return payload
+        except CpError as exc:
+            # 统一授权失败处理: 伪造/跨作业/旧纪元令牌同样留下安全事件
+            if isinstance(exc, (InvalidToken, FenceViolation)):
+                self._deny(job, exc, credential="epoch_token",
+                           operation=operation,
+                           expected_generation=job.current_generation)
+            raise
 
     def upload_shard(
         self,
@@ -484,7 +657,8 @@ class JobManager:
     ) -> dict:
         job = self.get(job_id)
         with job.lock:
-            self._check_epoch_token(job, epoch_token)
+            self._check_epoch_token(job, epoch_token,
+                                    operation="upload_shard")
             if job.state != PREEMPTING:
                 raise Conflict(f"job is {job.state}, not accepting shards")
             proc = job.processes.get(rank)
@@ -504,15 +678,20 @@ class JobManager:
                 input_pos=input_pos,
             )
             cp = job.cpm.get(job.current_generation)
-            job._log(
-                "shard_uploaded" if is_new else "shard_upload_duplicate",
-                {
+            if is_new:
+                job._log("shard_uploaded", {
                     "shard": shard_id(rank, index),
                     "generation": job.current_generation,
-                    "blob": shard.blob[:12],
+                    "rank": rank, "index": index, "node": node,
+                    "blob": shard.blob, "size": shard.size,
                     "input_pos": input_pos,
-                },
-            )
+                    "uploaded_ts": shard.uploaded_ts,
+                }, ts=shard.uploaded_ts)
+            else:
+                job._log("shard_upload_duplicate", {
+                    "shard": shard_id(rank, index),
+                    "generation": job.current_generation,
+                    "input_pos": input_pos})
             return {"shard": shard.ref(), "stored": is_new,
                     "checkpoint": cp.to_dict()}
 
@@ -521,7 +700,8 @@ class JobManager:
         """提交检查点: 全部分片重校验通过才可 COMPLETE。"""
         job = self.get(job_id)
         with job.lock:
-            self._check_epoch_token(job, epoch_token)
+            self._check_epoch_token(job, epoch_token,
+                                    operation="commit_checkpoint")
             gen = job.current_generation
             cp_before = job.cpm.get(gen)
             if cp_before.state == COMPLETE:
@@ -533,7 +713,9 @@ class JobManager:
                 )
             cp = job.cpm.commit(gen)
             job._log("checkpoint_complete", {
-                "generation": gen, "shards": len(cp.shards)})
+                "generation": gen, "shards": len(cp.shards),
+                "completed_ts": cp.completed_ts, "manifest": cp.manifest},
+                ts=cp.completed_ts)
             return {"checkpoint": cp.to_dict(), "already_complete": False}
 
     # ------------------------------------------------------------- release
@@ -541,7 +723,8 @@ class JobManager:
         """确认释放资源 — 只有当前纪元检查点 COMPLETE 才允许。"""
         job = self.get(job_id)
         with job.lock:
-            self._check_epoch_token(job, epoch_token)
+            self._check_epoch_token(job, epoch_token,
+                                    operation="confirm_release")
             gen = job.current_generation
             cp = job.cpm.get(gen)
             if cp.state != COMPLETE:
@@ -550,13 +733,20 @@ class JobManager:
                     f"{gen} is {cp.state}, not COMPLETE; missing/verified "
                     f"shards: {cp.missing()}"
                 )
+            ts = time.time()
             job.state = RELEASED
             job.released_generation = gen
-            job.released_ts = time.time()
-            job.leases.revoke_generation(job.output_generation)
-            job._log("resources_released", {"generation": gen})
+            job.released_ts = ts
+            revoked = job.leases.revoke_generation(job.output_generation)
+            if revoked is not None and revoked.state == "REVOKED":
+                self._record(job_id, "lease_revoked", {
+                    "generation": revoked.generation,
+                    "lease_id": revoked.lease_id,
+                    "revoked_ts": revoked.revoked_ts,
+                }, ts=revoked.revoked_ts)
+            job._log("resources_released", {"generation": gen}, ts=ts)
             return {"released": True, "generation": gen,
-                    "released_ts": job.released_ts, "job": job.snapshot()}
+                    "released_ts": ts, "job": job.snapshot()}
 
     def abort_epoch(self, job_id: str, *, reason: str = "grace_expired") -> dict:
         """调度器在宽限期用尽后放弃: 检查点 INCOMPLETE, 作业 ABORTED。"""
@@ -566,11 +756,19 @@ class JobManager:
             cp = job.cpm.get(gen)
             if cp.state == COMPLETE:
                 raise Conflict("checkpoint already complete; release instead")
+            ts = time.time()
             job.cpm.mark_incomplete(gen)
             job.state = ABORTED
-            job.aborted_ts = time.time()
-            job.leases.revoke_generation(job.output_generation)
-            job._log("epoch_abandoned", {"generation": gen, "reason": reason})
+            job.aborted_ts = ts
+            revoked = job.leases.revoke_generation(job.output_generation)
+            if revoked is not None and revoked.state == "REVOKED":
+                self._record(job_id, "lease_revoked", {
+                    "generation": revoked.generation,
+                    "lease_id": revoked.lease_id,
+                    "revoked_ts": revoked.revoked_ts,
+                }, ts=revoked.revoked_ts)
+            job._log("epoch_abandoned", {"generation": gen, "reason": reason},
+                     ts=ts)
             return {"aborted": True, "generation": gen,
                     "checkpoint": cp.to_dict()}
 
@@ -579,39 +777,43 @@ class JobManager:
         self,
         job_id: str,
         *,
-        lease_token: str,
+        lease_token: str | None,
         output_id: str,
         data: bytes,
         rank: int | None = None,
     ) -> dict:
-        """提交最终输出。租约栅栏 + (代际, output_id) 幂等双重防护。"""
+        """提交最终输出。
+
+        授权失败统一处理: 缺失/伪造/超期/已吊销/跨作业/旧代际凭证一律
+        得到稳定错误 (401/412 + reason + 固定消息), 并写入一条不含凭证
+        原文的顺序化安全事件; 请求在授权前终止, OutputLog 不发生任何
+        写入 —— 重复并发请求不可能增加结果条目。
+        """
         job = self.get(job_id)
         with job.lock:
             gen = job.output_generation
             try:
                 lease = job.leases.authorize(
-                    lease_token, expected_generation=gen
-                )
-            except FenceViolation as exc:
-                digest = hashlib.sha256(data).hexdigest()[:12]
-                job._log("output_fenced", {
-                    "output_id": output_id, "attempted_blob": digest,
-                    "reason": str(exc)})
+                    lease_token, expected_generation=gen)
+            except CpError as exc:
+                self._deny(job, exc, credential="output_lease",
+                           operation="append_output",
+                           expected_generation=gen,
+                           output_id=output_id, data=data)
                 raise
-            digest, size, stored_blob = job.store.put(data)
+            digest, size, _stored = job.store.put(data)
+            ts = time.time()
             rec, is_new = job.outputs.append(
-                generation=gen,
-                output_id=output_id,
-                blob=digest,
-                size=size,
-                rank=rank,
-                ts=time.time(),
-            )
-            job._log(
-                "output_committed" if is_new else "output_duplicate",
-                {"output_id": output_id, "generation": gen,
-                 "blob": digest[:12], "rank": rank},
-            )
+                generation=gen, output_id=output_id, blob=digest, size=size,
+                rank=rank, ts=ts)
+            if is_new:
+                job._log("output_committed", {
+                    "output_id": output_id, "generation": gen,
+                    "blob": digest, "size": size, "rank": rank, "ts": ts}, ts=ts)
+            else:
+                job._log("output_duplicate", {
+                    "output_id": output_id, "generation": gen,
+                    "blob": digest[:12], "rank": rank})
             return {"record": rec.to_dict(), "delivered": is_new,
                     "generation": gen, "lease_id": lease.lease_id}
 
@@ -648,11 +850,9 @@ class JobManager:
                 )
             existing = {c.generation for c in job.cpm.list_all()}
             if generation not in existing:
-                report = self._failed_report(
+                return self._failed_report(
                     job, generation, checkpoint_state="MISSING",
                     error=f"no checkpoint exists for generation {generation}")
-                job._last_restore = report
-                return report
             if job.released_generation != generation:
                 raise FenceViolation(
                     "restore generation mismatch: checkpoint was released "
@@ -662,12 +862,10 @@ class JobManager:
             cp = job.cpm.get(generation)
 
             if cp.state != COMPLETE:
-                report = self._failed_report(
+                return self._failed_report(
                     job, generation, checkpoint_state=cp.state,
                     error=f"checkpoint is {cp.state}, only COMPLETE "
                           "checkpoints can be restored")
-                job._last_restore = report
-                return report
 
             # 恢复时再次对每一个分片做内容重校验 (不信任提交时刻的结论)
             failed, positions = [], {}
@@ -680,12 +878,10 @@ class JobManager:
                     else:
                         positions[sid] = sh.input_pos
             if failed:
-                report = self._failed_report(
+                return self._failed_report(
                     job, generation, checkpoint_state=cp.state,
                     error="post-hoc shard verification failed",
                     failed=failed, cp=cp)
-                job._last_restore = report
-                return report
 
             new_rank_nodes = new_rank_nodes or {
                 r: n for r, n in cp.processes
@@ -711,32 +907,22 @@ class JobManager:
             # 同代际恢复: 输出代际沿用 checkpoint 代际, 但签发全新租约;
             # 旧 lease 已在抢占/释放时吊销, 旧进程令牌不可能通过新栅栏
             lease = job.leases.grant(generation, ttl)
+            self._record(job_id, "lease_granted", {
+                "generation": generation, "lease_id": lease.lease_id,
+                "issued_ts": lease.issued_ts, "expires_ts": lease.expires_ts,
+                "state": lease.state,
+            }, ts=lease.issued_ts)
+            ts = time.time()
+            self._apply_placement(job, new_rank_nodes, ts)
             job.output_generation = generation
             job.state = RUNNING
             job.restored_generation = generation
-
-            # 重建节点/进程视图 (新的 incarnation)
-            for r, n in new_rank_nodes.items():
-                old_node = job.processes[r].node
-                proc = job.processes[r]
-                proc.node = n
-                proc.state = ALIVE
-                proc.incarnation += 1
-                proc.last_heartbeat = time.time()
-                node = job.nodes.setdefault(n, Node(node_id=n))
-                if r not in node.ranks:
-                    node.ranks.append(r)
-                node.state = UP
-                node.last_heartbeat = time.time()
-                if old_node != n and old_node in job.nodes:
-                    old = job.nodes[old_node]
-                    old.ranks = [x for x in old.ranks if x != r]
 
             report = RestoreReport(
                 job_id=job.job_id,
                 requested_generation=generation,
                 success=True,
-                ts=time.time(),
+                ts=ts,
                 checkpoint_state=cp.state,
                 manifest_digest=(cp.manifest or {}).get("manifest_digest"),
                 shards_total=cp.expected_total,
@@ -749,12 +935,34 @@ class JobManager:
                 relocated_ranks=relocated,
                 lease=lease.to_dict(),
                 warnings=warnings,
+                security_events=self.security_events(job_id),
             )
             job._last_restore = report
             job._log("restore_verified", {
                 "generation": generation, "shards": cp.expected_total,
-                "lease_id": lease.lease_id, "relocated": relocated})
+                "lease_id": lease.lease_id, "relocated": relocated,
+                "report": report.to_dict()}, ts=ts)
             return report
+
+    @staticmethod
+    def _apply_placement(job: Job, new_rank_nodes: dict[int, str],
+                         ts: float) -> None:
+        """按新放置重建节点/进程视图 (新的 incarnation)。"""
+        for r, n in new_rank_nodes.items():
+            old_node = job.processes[r].node
+            proc = job.processes[r]
+            proc.node = n
+            proc.state = ALIVE
+            proc.incarnation += 1
+            proc.last_heartbeat = ts
+            node = job.nodes.setdefault(n, Node(node_id=n))
+            if r not in node.ranks:
+                node.ranks.append(r)
+            node.state = UP
+            node.last_heartbeat = ts
+            if old_node != n and old_node in job.nodes:
+                old = job.nodes[old_node]
+                old.ranks = [x for x in old.ranks if x != r]
 
     def _failed_report(
         self, job: Job, generation: int, *, checkpoint_state: str,
@@ -768,11 +976,12 @@ class JobManager:
                     sid = shard_id(r, i)
                     if sid in cp.shards and sid not in (failed or []):
                         positions[sid] = cp.shards[sid].input_pos
+        ts = time.time()
         report = RestoreReport(
             job_id=job.job_id,
             requested_generation=generation,
             success=False,
-            ts=time.time(),
+            ts=ts,
             checkpoint_state=checkpoint_state,
             manifest_digest=(
                 (cp.manifest or {}).get("manifest_digest") if cp else None
@@ -786,15 +995,30 @@ class JobManager:
                 if cp else []
             ),
             error=error,
+            security_events=self.security_events(job.job_id),
         )
-        job._log("restore_rejected", {"generation": generation, "error": error})
+        job._last_restore = report
+        job._log("restore_rejected", {"generation": generation,
+                                      "error": error,
+                                      "report": report.to_dict()}, ts=ts)
         return report
+
+    def last_restore_report_dict(self, job_id: str) -> dict:
+        """报告读取: 持久化报告 + 补充报告生成之后该作业的全部安全事件。"""
+        return self.last_restore_report(job_id).to_dict()
 
     def last_restore_report(self, job_id: str) -> RestoreReport:
         job = self.get(job_id)
         if job._last_restore is None:
             raise NotFound(f"no restore attempt for job {job_id}")
-        return job._last_restore
+        # 返回时补充报告生成之后新发生的安全事件: 冻结的判定结论不变,
+        # 但授权拒绝证据始终完整可查 (页面/报告/重启后一致)。
+        report = self._enrich_report_security(job._last_restore)
+        return report
+
+    def _enrich_report_security(self, report: RestoreReport) -> RestoreReport:
+        events = self.security_events(report.job_id)
+        return dataclasses.replace(report, security_events=events)
 
     # ------------------------------------------------------------ progress
     def progress_page_data(self, job_id: str) -> dict:
@@ -820,5 +1044,144 @@ class JobManager:
                 "shards": shard_index,
                 "outputs": [r.to_dict() for r in job.outputs.list()],
                 "audit": list(reversed(job.audit)),
+                "security_events": list(
+                    reversed(self.security_events(job_id))),
                 "server_ts": time.time(),
             }
+
+    # ============================================================ replay
+    def _replay(self) -> None:
+        """按 seq 顺序重放全部持久化事件, 重建内存状态。"""
+        for evt in self.journal.replay():
+            self._apply(evt)
+
+    def _apply(self, evt: dict) -> None:
+        etype = evt["type"]
+        detail = {k: v for k, v in evt.items()
+                  if k not in ("seq", "ts", "type")}
+        ts = evt.get("ts") or time.time()
+        job_id = detail.get("job_id")
+
+        if etype == "job_created":
+            rank_nodes = {int(r): n for r, n in
+                          detail["rank_nodes"].items()}
+            job = Job(
+                job_id=job_id, name=detail["name"],
+                world_size=detail["world_size"],
+                shards_per_rank=detail["shards_per_rank"],
+                rank_nodes=rank_nodes, store=self.store,
+                scheduler=self.scheduler, manager=self,
+                now=detail.get("created_ts", ts),
+                lease_ttl=detail.get("lease_ttl", 300.0),
+            )
+            self._jobs[job_id] = job
+            self._audit_only(job, etype, ts, detail)
+            return
+
+        job = self._jobs.get(job_id)
+        if job is None:
+            return  # 无法归属的历史事件忽略
+
+        if etype == "lease_granted":
+            job.leases.restore_grant(
+                generation=detail["generation"],
+                lease_id=detail["lease_id"],
+                issued_ts=detail["issued_ts"],
+                expires_ts=detail["expires_ts"],
+                state=detail.get("state", "ACTIVE"))
+        elif etype == "lease_revoked":
+            job.leases.restore_revoke(detail["generation"],
+                                      detail.get("revoked_ts", ts))
+        elif etype == "preempt_issued":
+            ep_dict = detail["epoch_obj"]
+            ep = self.scheduler.restore_epoch(ep_dict)
+            job.current_epoch = ep.epoch
+            job.current_generation = ep.generation
+            job.state = PREEMPTING
+            job.epoch_token = ep.token
+            job.cpm.supersede_pending(ep.generation)
+            job.cpm.restore_after_preempt(
+                epoch=ep.epoch, generation=ep.generation,
+                world_size=job.world_size,
+                shards_per_rank=job.shards_per_rank,
+                created_ts=ep.issued_ts,
+                processes=sorted(
+                    (r, p.node) for r, p in job.processes.items()))
+        elif etype == "node_lost":
+            node = job.nodes.get(detail["node"])
+            if node is not None:
+                node.state = LOST
+                for rank in node.ranks:
+                    job.processes[rank].state = LOST
+        elif etype == "node_recovered":
+            node = job.nodes.get(detail["node"])
+            if node is not None:
+                node.state = UP
+                node.last_heartbeat = ts
+                for rank in node.ranks:
+                    proc = job.processes[rank]
+                    proc.last_heartbeat = ts
+                    if proc.state == LOST:
+                        proc.state = ALIVE
+                        proc.incarnation += 1
+        elif etype == "node_heartbeat":
+            node = job.nodes.get(detail["node"])
+            if node is not None:
+                node.last_heartbeat = ts
+                for rank in node.ranks:
+                    job.processes[rank].last_heartbeat = ts
+        elif etype == "progress_reported":
+            proc = job.processes.get(detail["rank"])
+            if proc is not None:
+                proc.last_input_pos = detail["input_pos"]
+                proc.last_progress_ts = ts
+        elif etype == "shard_uploaded":
+            job.cpm.restore_shard(
+                generation=detail["generation"], rank=detail["rank"],
+                index=detail["index"], node=detail["node"],
+                blob=detail["blob"], size=detail["size"],
+                input_pos=detail["input_pos"],
+                uploaded_ts=detail.get("uploaded_ts", ts))
+        elif etype == "checkpoint_complete":
+            job.cpm.restore_complete(
+                detail["generation"],
+                completed_ts=detail.get("completed_ts", ts),
+                manifest=detail.get("manifest"))
+        elif etype == "resources_released":
+            gen = detail["generation"]
+            job.state = RELEASED
+            job.released_generation = gen
+            job.released_ts = ts
+        elif etype == "epoch_abandoned":
+            gen = detail["generation"]
+            job.cpm.mark_incomplete(gen)
+            job.state = ABORTED
+            job.aborted_ts = ts
+        elif etype == "output_committed":
+            job.outputs.restore(
+                generation=detail["generation"],
+                output_id=detail["output_id"], blob=detail["blob"],
+                size=detail["size"], rank=detail.get("rank"),
+                ts=detail.get("ts", ts))
+        elif etype == "restore_verified":
+            rep = RestoreReport(**detail["report"])
+            placement = {p["rank"]: p["node"] for p in rep.new_processes}
+            self._apply_placement(job, placement, rep.ts)
+            job.output_generation = rep.requested_generation
+            job.state = RUNNING
+            job.restored_generation = rep.requested_generation
+            job._last_restore = rep
+        elif etype == "restore_rejected":
+            job._last_restore = RestoreReport(**detail["report"])
+        elif etype == SECURITY_DENIED:
+            self._security.append(evt)
+        # 其余事件 (preempt_duplicate / shard_upload_duplicate /
+        # commit_duplicate / output_duplicate) 仅审计, 无状态变更
+
+        self._audit_only(job, etype, ts, detail)
+
+    @staticmethod
+    def _audit_only(job: Job, etype: str, ts: float, detail: dict) -> None:
+        job.audit.append({"ts": ts, "event": etype, "detail": detail})
+        if len(job.audit) > AUDIT_LIMIT:
+            del job.audit[:-AUDIT_LIMIT]
